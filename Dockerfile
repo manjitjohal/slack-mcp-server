@@ -30,4 +30,7 @@ RUN npm ci --ignore-scripts --omit-dev
 RUN npm install -g .
 
 # Use tini as PID 1 for proper signal handling
-ENTRYPOINT ["tini", "--", "slack-mcp"]
+# Default to HTTP transport mode for cloud deployment (Railway, etc.)
+# AUTH_TOKEN and PORT are read from environment variables at runtime
+ENTRYPOINT ["tini", "--"]
+CMD ["node", "dist/index.js", "--transport", "http"]
