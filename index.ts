@@ -50,14 +50,22 @@ interface GetUserProfileArgs {
   user_id: string;
 }
 
+interface SearchMessagesArgs {
+  query: string;
+  count?: number;
+  sort?: 'score' | 'timestamp';
+}
+
 export class SlackClient {
   private botHeaders: { Authorization: string; "Content-Type": string };
+  private teamId: string;
 
-  constructor(botToken: string) {
+  constructor(botToken: string, teamId?: string) {
     this.botHeaders = {
       Authorization: `Bearer ${botToken}`,
       "Content-Type": "application/json",
     };
+    this.teamId = teamId || process.env.SLACK_TEAM_ID || '';
   }
 
   async getChannels(limit: number = 100, cursor?: string): Promise<any> {
@@ -67,9 +75,9 @@ export class SlackClient {
         types: "public_channel,private_channel",
         exclude_archived: "true",
         limit: Math.min(limit, 200).toString(),
-        team_id: process.env.SLACK_TEAM_ID!,
+        team_id: this.teamId,
       });
-  
+
       if (cursor) {
         params.append("cursor", cursor);
       }
@@ -191,7 +199,7 @@ export class SlackClient {
   async getUsers(limit: number = 100, cursor?: string): Promise<any> {
     const params = new URLSearchParams({
       limit: Math.min(limit, 200).toString(),
-      team_id: process.env.SLACK_TEAM_ID!,
+      team_id: this.teamId,
     });
 
     if (cursor) {
@@ -213,6 +221,26 @@ export class SlackClient {
 
     const response = await fetch(
       `https://slack.com/api/users.profile.get?${params}`,
+      { headers: this.botHeaders },
+    );
+
+    return response.json();
+  }
+
+  async searchMessages(query: string, count: number = 20, sort: string = 'score'): Promise<any> {
+    const params = new URLSearchParams({
+      query,
+      count: Math.min(count, 100).toString(),
+      sort,
+    });
+
+    // search.messages requires a user token (xoxp), but the per-session
+    // architecture means the backend injects the appropriate token via
+    // X-Slack-Token header. If this client was initialized with a user
+    // token, the call will succeed; with a bot token it will return
+    // "not_allowed_token_type".
+    const response = await fetch(
+      `https://slack.com/api/search.messages?${params}`,
       { headers: this.botHeaders },
     );
 
@@ -372,6 +400,25 @@ export function createSlackServer(slackClient: SlackClient): McpServer {
     }
   );
 
+  server.registerTool(
+    "slack_search_messages",
+    {
+      title: "Search Slack Messages",
+      description: "Search messages across Slack channels. Requires a user token (xoxp) with search:read scope.",
+      inputSchema: {
+        query: z.string().describe("Search query string"),
+        count: z.number().optional().default(20).describe("Number of results to return (default 20, max 100)"),
+        sort: z.enum(["score", "timestamp"]).optional().default("score").describe("Sort order: score (relevance) or timestamp (recent first)"),
+      },
+    },
+    async ({ query, count, sort }) => {
+      const response = await slackClient.searchMessages(query, count, sort);
+      return {
+        content: [{ type: "text", text: JSON.stringify(response) }],
+      };
+    }
+  );
+
   return server;
 }
 
@@ -383,7 +430,7 @@ async function runStdioServer(slackClient: SlackClient) {
   console.error("Slack MCP Server running on stdio");
 }
 
-async function runHttpServer(slackClient: SlackClient, port: number = 3000, authToken?: string) {
+async function runHttpServer(slackClient: SlackClient | null, port: number = 3000, authToken?: string) {
   console.error(`Starting Slack MCP Server with Streamable HTTP transport on port ${port}...`);
   
   const app = express();
@@ -423,8 +470,12 @@ async function runHttpServer(slackClient: SlackClient, port: number = 3000, auth
     next();
   };
 
-  // Map to store transports by session ID
-  const transports: { [sessionId: string]: StreamableHTTPServerTransport } = {};
+  // Map to store sessions with transport and per-session SlackClient
+  interface SessionInfo {
+    transport: StreamableHTTPServerTransport;
+    slackClient: SlackClient;
+  }
+  const sessions: { [sessionId: string]: SessionInfo } = {};
 
   // Handle POST requests for client-to-server communication
   app.post('/mcp', authMiddleware, async (req, res) => {
@@ -433,27 +484,48 @@ async function runHttpServer(slackClient: SlackClient, port: number = 3000, auth
       const sessionId = req.headers['mcp-session-id'] as string | undefined;
       let transport: StreamableHTTPServerTransport;
 
-      if (sessionId && transports[sessionId]) {
+      if (sessionId && sessions[sessionId]) {
         // Reuse existing transport
-        transport = transports[sessionId];
+        transport = sessions[sessionId].transport;
       } else if (!sessionId && req.body?.method === 'initialize') {
-        // New initialization request
+        // New initialization request — read per-session token from headers
+        const userToken = req.headers['x-slack-token'] as string | undefined;
+        const userTeamId = req.headers['x-slack-team-id'] as string | undefined;
+
+        // Create per-session SlackClient: prefer header token, fallback to default
+        let sessionClient: SlackClient;
+        if (userToken) {
+          sessionClient = new SlackClient(userToken, userTeamId);
+        } else if (slackClient) {
+          sessionClient = slackClient;
+        } else {
+          res.status(400).json({
+            jsonrpc: '2.0',
+            error: {
+              code: -32000,
+              message: 'Bad Request: No Slack token provided via X-Slack-Token header and no default token configured',
+            },
+            id: req.body?.id ?? null,
+          });
+          return;
+        }
+
         transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => randomUUID(),
-          onsessioninitialized: (sessionId) => {
-            // Store the transport by session ID
-            transports[sessionId] = transport;
+          onsessioninitialized: (sid) => {
+            // Store session with transport and client
+            sessions[sid] = { transport, slackClient: sessionClient };
           },
         });
 
-        // Clean up transport when closed
+        // Clean up session when closed
         transport.onclose = () => {
           if (transport.sessionId) {
-            delete transports[transport.sessionId];
+            delete sessions[transport.sessionId];
           }
         };
 
-        const server = createSlackServer(slackClient);
+        const server = createSlackServer(sessionClient);
         // Connect to the MCP server
         await server.connect(transport);
       } else {
@@ -489,12 +561,12 @@ async function runHttpServer(slackClient: SlackClient, port: number = 3000, auth
   // Reusable handler for GET and DELETE requests
   const handleSessionRequest = async (req: express.Request, res: express.Response) => {
     const sessionId = req.headers['mcp-session-id'] as string | undefined;
-    if (!sessionId || !transports[sessionId]) {
+    if (!sessionId || !sessions[sessionId]) {
       res.status(400).send('Invalid or missing session ID');
       return;
     }
-    
-    const transport = transports[sessionId];
+
+    const transport = sessions[sessionId].transport;
     await transport.handleRequest(req, res);
   };
 
@@ -517,6 +589,22 @@ async function runHttpServer(slackClient: SlackClient, port: number = 3000, auth
   const server = app.listen(port, '0.0.0.0', () => {
     console.error(`Slack MCP Server running on http://0.0.0.0:${port}/mcp`);
   });
+
+  // Expose a cleanup function for graceful shutdown
+  (server as any).cleanupSessions = async () => {
+    const sessionIds = Object.keys(sessions);
+    if (sessionIds.length > 0) {
+      console.error(`Closing ${sessionIds.length} active session(s)...`);
+      for (const sid of sessionIds) {
+        try {
+          await sessions[sid].transport.close();
+        } catch (err) {
+          console.error(`Error closing session ${sid}:`, err);
+        }
+        delete sessions[sid];
+      }
+    }
+  };
 
   return server;
 }
@@ -581,27 +669,38 @@ export async function main() {
   const botToken = process.env.SLACK_BOT_TOKEN;
   const teamId = process.env.SLACK_TEAM_ID;
 
-  if (!botToken || !teamId) {
+  // stdio mode requires env vars; HTTP mode gets tokens per-session from headers
+  if (transport === 'stdio' && (!botToken || !teamId)) {
     console.error(
-      "Please set SLACK_BOT_TOKEN and SLACK_TEAM_ID environment variables",
+      "Please set SLACK_BOT_TOKEN and SLACK_TEAM_ID environment variables (required for stdio mode)",
     );
     process.exit(1);
   }
 
-  const slackClient = new SlackClient(botToken);
+  // Create default client if env vars are present (used as fallback in HTTP mode)
+  const slackClient = botToken ? new SlackClient(botToken, teamId) : null;
   let httpServer: any = null;
 
   // Setup graceful shutdown handlers
   const setupGracefulShutdown = () => {
-    const shutdown = (signal: string) => {
+    const shutdown = async (signal: string) => {
       console.error(`\nReceived ${signal}. Shutting down gracefully...`);
-      
+
       if (httpServer) {
+        // Close all active sessions first
+        if (typeof httpServer.cleanupSessions === 'function') {
+          try {
+            await httpServer.cleanupSessions();
+          } catch (err) {
+            console.error('Error during session cleanup:', err);
+          }
+        }
+
         httpServer.close(() => {
           console.error('HTTP server closed.');
           process.exit(0);
         });
-        
+
         // Force close after 5 seconds
         setTimeout(() => {
           console.error('Forcing shutdown...');
@@ -620,7 +719,7 @@ export async function main() {
   setupGracefulShutdown();
 
   if (transport === 'stdio') {
-    await runStdioServer(slackClient);
+    await runStdioServer(slackClient!);
   } else if (transport === 'http') {
     // Use auth token from command line, environment variable, or generate random
     let finalAuthToken = authToken || process.env.AUTH_TOKEN;
