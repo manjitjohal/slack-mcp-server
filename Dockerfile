@@ -6,7 +6,7 @@ COPY . /app
 WORKDIR /app
 
 # Install all dependencies (including devDependencies) for building
-RUN --mount=type=cache,target=/root/.npm npm install
+RUN npm install
 
 # Build the project (this will use the devDependencies like typescript and shx)
 RUN npm run build
